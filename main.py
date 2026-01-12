@@ -286,24 +286,30 @@ def load_model(model_name: str = None):
             model_path = "microsoft/VibeVoice-1.5B"
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Using device: {device}, model path: {model_path}")
 
         # Initialize voice mapper if not already done
         if voice_mapper is None:
+            logger.info("Initializing voice mapper...")
             voice_mapper = VoiceMapper(builtin_path="demo/voices", user_path="voices")
 
         # Load processor and model
+        logger.info("Loading processor...")
         processor = VibeVoiceProcessor.from_pretrained(model_path)
+        logger.info("Processor loaded. Loading model (this may take several minutes)...")
+        
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             device_map=device,
             attn_implementation="sdpa"
         )
+        logger.info("Model loaded. Setting to eval mode and configuring inference steps...")
         model.eval()
         model.set_ddpm_inference_steps(num_steps=10)
 
         last_used = time.time()
-        logger.info(f"{model_to_load.upper()} model loaded successfully.")
+        logger.info(f"{model_to_load.upper()} model loaded successfully and ready for inference.")
 
 
 def unload_model():
@@ -348,7 +354,11 @@ def ensure_model_loaded():
 
     with model_lock:
         if model is None:
-            load_model()
+            try:
+                load_model()
+            except Exception as e:
+                logger.error(f"Failed to load model: {e}", exc_info=True)
+                raise
         else:
             last_used = time.time()
 
@@ -386,11 +396,25 @@ def generation_worker():
 
         try:
             logger.info(f"Worker picked up task {task_id}.")
-            tasks[task_id]["status"] = "running"
             start_time = time.time()
 
-            # Ensure model is loaded before processing
+            # Check if model needs to be loaded and update status
+            needs_loading = False
+            with model_lock:
+                if model is None:
+                    needs_loading = True
+            
+            if needs_loading:
+                logger.info(f"Model not loaded, loading now for task {task_id}...")
+                tasks[task_id]["status"] = "loading_model"
+            
+            # Ensure model is loaded before processing (this may take several minutes)
             ensure_model_loaded()
+            
+            # Update status to running after model is loaded
+            if needs_loading:
+                logger.info(f"Model loaded successfully, starting generation for task {task_id}...")
+                tasks[task_id]["status"] = "running"
 
             # --- Core Inference Logic ---
             scripts, speaker_numbers = parse_txt_script(script_content)
