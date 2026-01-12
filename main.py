@@ -319,12 +319,18 @@ def load_model(model_name: str = None, _lock_acquired: bool = False):
         print("Processor loaded. Loading model from Hugging Face (this may take several minutes)...", flush=True)
         logger.info("Processor loaded. Loading model (this may take several minutes)...")
 
+        # Load model - use device_map for initial load, but we'll manage device manually for better unload control
+        # Note: device_map="cuda" can make unloading harder, but it's needed for large models
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
-            device_map=device,
+            device_map=device if device == "cuda" else None,  # Only use device_map for CUDA
             attn_implementation="sdpa"
         )
+
+        # If device_map wasn't used, manually move to device
+        if device == "cuda" and not hasattr(model, 'hf_device_map'):
+            model = model.to(device)
         print("Model loaded. Setting to eval mode and configuring inference steps...", flush=True)
         logger.info("Model loaded. Setting to eval mode and configuring inference steps...")
         model.eval()
@@ -383,6 +389,7 @@ def unload_model():
     """
     Fully unload the model and processor, clearing GPU memory.
     This aggressively releases all GPU memory to ensure NVRAM is fully freed.
+    Handles device_map models by explicitly moving all parameters and buffers.
     """
     global model, processor, last_used
 
@@ -395,11 +402,42 @@ def unload_model():
         print("Unloading model and clearing GPU memory...", flush=True)
         logger.info("Unloading model and clearing GPU memory...")
 
+        # Get initial memory before unload
+        if torch.cuda.is_available():
+            initial_allocated = torch.cuda.memory_allocated() / 1024**3
+            initial_reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"GPU memory before unload - Allocated: {initial_allocated:.2f} GB, Reserved: {initial_reserved:.2f} GB", flush=True)
+
         # Recursively move all model components to CPU
-        # This is important when using device_map which may split model across devices
+        # This is critical when using device_map which may split model across devices
         if model is not None:
             try:
-                # Move entire model to CPU
+                # First, try to handle device_map models
+                # Check if model has hf_device_map attribute (from accelerate)
+                if hasattr(model, 'hf_device_map'):
+                    print("Model uses device_map, moving all components to CPU...", flush=True)
+                    # Clear the device_map to release memory
+                    try:
+                        model.hf_device_map = None
+                    except:
+                        pass
+
+                # Move all parameters and buffers explicitly (regardless of device_map)
+                print("Moving all parameters and buffers to CPU...", flush=True)
+                param_count = 0
+                buffer_count = 0
+                for name, param in model.named_parameters():
+                    if param.is_cuda:
+                        param.data = param.data.cpu()
+                        param_count += 1
+                for name, buffer in model.named_buffers():
+                    if buffer.is_cuda:
+                        buffer.data = buffer.data.cpu()
+                        buffer_count += 1
+                if param_count > 0 or buffer_count > 0:
+                    print(f"Moved {param_count} parameters and {buffer_count} buffers to CPU", flush=True)
+
+                # Move entire model to CPU (this should handle most cases)
                 if hasattr(model, 'to'):
                     model = model.to('cpu')
                 elif hasattr(model, 'cpu'):
@@ -413,9 +451,46 @@ def unload_model():
                                 module.to('cpu')
                             except:
                                 pass
+                        # Also move all parameters and buffers in each module
+                        for param in module.parameters(recurse=False):
+                            if param.is_cuda:
+                                param.data = param.data.cpu()
+                        for buffer in module.buffers(recurse=False):
+                            if buffer.is_cuda:
+                                buffer.data = buffer.data.cpu()
+
+                # Clear any cached values
+                if hasattr(model, 'cache_clear'):
+                    try:
+                        model.cache_clear()
+                    except:
+                        pass
+
             except Exception as e:
                 print(f"Warning: Error moving model to CPU: {e}", flush=True)
                 logger.warning(f"Error moving model to CPU: {e}")
+
+        # Clear processor caches and move to CPU
+        if processor is not None:
+            try:
+                # Clear any cached tensors in processor
+                if hasattr(processor, 'cache_clear'):
+                    try:
+                        processor.cache_clear()
+                    except:
+                        pass
+
+                # Move processor components to CPU if they have tensors
+                for attr_name in dir(processor):
+                    try:
+                        attr = getattr(processor, attr_name, None)
+                        if isinstance(attr, torch.Tensor) and attr.is_cuda:
+                            setattr(processor, attr_name, attr.cpu())
+                    except:
+                        pass
+            except Exception as e:
+                print(f"Warning: Error clearing processor: {e}", flush=True)
+                logger.warning(f"Error clearing processor: {e}")
 
         # Delete model and processor references
         model_to_delete = model
@@ -430,20 +505,21 @@ def unload_model():
         del model_to_delete
         del processor_to_delete
 
-        # Aggressively clear GPU memory
+        # Aggressively clear GPU memory with multiple passes
         if torch.cuda.is_available():
-            # Synchronize all CUDA operations
+            # Synchronize all CUDA operations first
             torch.cuda.synchronize()
 
-            # Clear cache multiple times
-            for _ in range(3):
+            # Multiple passes of cache clearing and garbage collection
+            for pass_num in range(5):
+                # Clear cache
                 torch.cuda.empty_cache()
-
-            # Force garbage collection multiple times
-            for _ in range(3):
+                # Force garbage collection
                 gc.collect()
+                # Synchronize
+                torch.cuda.synchronize()
 
-            # Final cache clear
+            # Final aggressive clear
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
 
@@ -453,12 +529,20 @@ def unload_model():
             except:
                 pass
 
+            # Try to release memory to OS (if available in newer PyTorch)
+            try:
+                torch.cuda.memory.empty_cache()
+            except:
+                pass
+
             # Print memory info for debugging
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"GPU memory after unload - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB", flush=True)
-                logger.info(f"GPU memory after unload - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            freed = initial_allocated - allocated if 'initial_allocated' in locals() else 0
+            print(f"GPU memory after unload - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB", flush=True)
+            if freed > 0:
+                print(f"Freed: {freed:.2f} GB ({freed/initial_allocated*100:.1f}%)", flush=True)
+            logger.info(f"GPU memory after unload - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
 
         print("Model unloaded and GPU memory cleared.", flush=True)
         logger.info("Model unloaded and GPU memory cleared.")
