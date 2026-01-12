@@ -9,7 +9,7 @@ A production-ready FastAPI wrapper for Microsoft's VibeVoice model, enabling hig
 ## ✨ Features
 
 - 🎯 **Multi-Speaker TTS**: Generate conversations with up to 4 distinct speakers
-- ⚡ **Asynchronous Processing**: Queue-based system handles multiple requests efficiently  
+- ⚡ **Asynchronous Processing**: Queue-based system handles multiple requests efficiently
 - 📊 **Status Tracking**: Real-time job status and queue position monitoring
 - 🔄 **Rate Limiting**: Built-in protection against API abuse (10 requests/minute)
 - 🎵 **Voice Presets**: Pre-configured voice samples for immediate use
@@ -76,14 +76,31 @@ pip install -e .
 ### Starting the API Server
 
 ```bash
-# Basic usage (defaults to port 8000)
+# Basic usage (defaults to 1.5B model, port 8000)
 python main.py
 
+# Use the 7B model
+python main.py --model 7b
+
 # Custom host and port
+python main.py --host 0.0.0.0 --port 8008
+
+# Custom auto-unload timeout (in seconds, default: 10)
+python main.py --unload-timeout 30
+
+# Disable auto-unload (keep model loaded permanently)
+python main.py --unload-timeout 0
+
+# All options combined
+python main.py --model 7b --host 0.0.0.0 --port 8008 --unload-timeout 30
+
+# Using uvicorn directly
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 The API will be available at `http://localhost:8000` with interactive documentation at `http://localhost:8000/docs`.
+
+**Note:** The model uses lazy loading - it will be loaded automatically on the first generation request. If no requests are made for the specified timeout period (default: 10 seconds), the model will be automatically unloaded to free GPU memory.
 
 ## 📚 API Documentation
 
@@ -157,7 +174,7 @@ Get all available voice presets.
 ```json
 [
   "en-Alice_woman",
-  "en-Carter_man", 
+  "en-Carter_man",
   "en-Frank_man",
   "en-Mary_woman_bgm",
   "zh-Bowen_man",
@@ -189,7 +206,7 @@ import time
 # Submit generation request
 response = requests.post("http://localhost:8000/generate", json={
     "script": "Speaker 1: Welcome to our podcast!\nSpeaker 2: Thanks for having me!",
-    "speaker_names": ["en-Alice_woman", "en-Carter_man"], 
+    "speaker_names": ["en-Alice_woman", "en-Carter_man"],
     "cfg_scale": 1.3
 })
 
@@ -200,7 +217,7 @@ print(f"Task submitted: {task_id}")
 while True:
     status_response = requests.get(f"http://localhost:8000/status/{task_id}")
     status = status_response.json()["status"]
-    
+
     if status == "completed":
         # Download the result
         audio_response = requests.get(f"http://localhost:8000/result/{task_id}")
@@ -240,10 +257,57 @@ curl "http://localhost:8000/voices"
 ## ⚙️ Configuration
 
 ### Model Selection
-By default, the API uses `microsoft/VibeVoice-1.5B`. To use the 7B model, modify line 165 in `main.py`:
-```python
-model_path = "WestZhang/VibeVoice-Large-pt"
+
+You can switch between models using command-line arguments - **no code changes required**:
+
+```bash
+# Use the 1.5B model (default, faster, less memory)
+python main.py --model 1.5b
+
+# Use the 7B model (better quality, more memory)
+python main.py --model 7b
 ```
+
+**Available Models:**
+- `1.5b` - Microsoft VibeVoice-1.5B (default)
+  - Context: 64K tokens
+  - Generation: ~90 minutes
+  - GPU Memory: ~8GB
+  - Hugging Face: [microsoft/VibeVoice-1.5B](https://huggingface.co/microsoft/VibeVoice-1.5B)
+
+- `7b` - VibeVoice-7B-Preview
+  - Context: 32K tokens
+  - Generation: ~45 minutes
+  - GPU Memory: ~16GB
+  - Hugging Face: [WestZhang/VibeVoice-Large-pt](https://huggingface.co/WestZhang/VibeVoice-Large-pt)
+
+### Auto-Unload Feature
+
+The API includes an automatic model unloading feature to free GPU memory when the model is not in use:
+
+- **Default timeout**: 10 seconds of inactivity
+- **Customizable**: Use `--unload-timeout` to set your preferred timeout
+- **Disable**: Set `--unload-timeout 0` to keep the model loaded permanently
+- **Automatic reload**: Model will be automatically reloaded on the next request
+
+**Examples:**
+```bash
+# 30 second timeout
+python main.py --unload-timeout 30
+
+# Disable auto-unload (keep model in memory)
+python main.py --unload-timeout 0
+
+# 5 second timeout for quick memory release
+python main.py --unload-timeout 5
+```
+
+**How it works:**
+1. Model loads automatically on first generation request (lazy loading)
+2. After each use, a timer tracks inactivity
+3. If no requests are made within the timeout period, the model is fully unloaded
+4. GPU memory is completely released (same as restarting the application)
+5. Next request will automatically reload the model
 
 ### Voice Directory
 Place your custom voice samples in `demo/voices/` directory. Supported format: WAV files.
@@ -302,7 +366,7 @@ This project is a FastAPI wrapper around Microsoft's VibeVoice model. Please ref
 
 **Responsible AI Usage:**
 - Disclose AI-generated content when sharing
-- Ensure compliance with local laws and regulations  
+- Ensure compliance with local laws and regulations
 - Verify content accuracy and avoid misleading applications
 - Do not use for deepfakes or disinformation
 

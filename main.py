@@ -5,6 +5,7 @@ import uuid
 import queue
 import threading
 import argparse
+import gc
 from typing import List, Tuple, Dict, Any, Optional
 
 import torch
@@ -42,6 +43,11 @@ processor: Optional[VibeVoiceProcessor] = None
 voice_mapper: Optional[Any] = None
 tasks: Dict[str, Dict[str, Any]] = {}
 selected_model: str = "1.5b"  # Default model
+model_lock = threading.Lock()  # Lock for thread-safe model operations
+last_used: float = 0.0  # Timestamp of last model usage
+unload_timeout: float = 10.0  # Seconds of inactivity before auto-unload (default: 10)
+unload_monitor_thread: Optional[threading.Thread] = None
+monitor_running = False  # Flag to control the monitor thread
 
 # --- Helper Classes ---
 
@@ -253,6 +259,119 @@ def parse_txt_script(txt_content: str) -> Tuple[List[str], List[str]]:
         speaker_numbers.append(current_speaker)
     return scripts, speaker_numbers
 
+# --- Model Management Functions ---
+
+def load_model(model_name: str = None):
+    """
+    Load the VibeVoice model and processor.
+
+    Args:
+        model_name: Model to load ("1.5b" or "7b"). Uses selected_model if None.
+    """
+    global model, processor, voice_mapper, selected_model, last_used
+
+    with model_lock:
+        if model is not None:
+            logger.info("Model already loaded, skipping reload.")
+            last_used = time.time()
+            return
+
+        model_to_load = model_name.lower() if model_name else selected_model.lower()
+        logger.info(f"Loading {model_to_load.upper()} model...")
+
+        # Select model path based on model name
+        if model_to_load == "7b":
+            model_path = "WestZhang/VibeVoice-Large-pt"
+        else:
+            model_path = "microsoft/VibeVoice-1.5B"
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Initialize voice mapper if not already done
+        if voice_mapper is None:
+            voice_mapper = VoiceMapper(builtin_path="demo/voices", user_path="voices")
+
+        # Load processor and model
+        processor = VibeVoiceProcessor.from_pretrained(model_path)
+        model = VibeVoiceForConditionalGenerationInference.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map=device,
+            attn_implementation="sdpa"
+        )
+        model.eval()
+        model.set_ddpm_inference_steps(num_steps=10)
+
+        last_used = time.time()
+        logger.info(f"{model_to_load.upper()} model loaded successfully.")
+
+
+def unload_model():
+    """
+    Fully unload the model and processor, clearing GPU memory.
+    """
+    global model, processor, last_used
+
+    with model_lock:
+        if model is None:
+            logger.info("Model already unloaded.")
+            return
+
+        logger.info("Unloading model and clearing GPU memory...")
+
+        # Move model to CPU and delete
+        if hasattr(model, 'cpu'):
+            model = model.cpu()
+
+        # Delete model and processor
+        del model
+        del processor
+
+        # Clear PyTorch cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            # Force garbage collection
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        model = None
+        processor = None
+        last_used = 0.0
+
+        logger.info("Model unloaded and GPU memory cleared.")
+
+
+def ensure_model_loaded():
+    """Ensure the model is loaded before use."""
+    global model, last_used
+
+    with model_lock:
+        if model is None:
+            load_model()
+        else:
+            last_used = time.time()
+
+
+def unload_monitor():
+    """
+    Background thread that monitors model usage and unloads after timeout.
+    """
+    global monitor_running, last_used, unload_timeout
+
+    logger.info(f"Model auto-unload monitor started (timeout: {unload_timeout}s)")
+
+    while monitor_running:
+        time.sleep(1.0)  # Check every second
+
+        with model_lock:
+            if model is not None and last_used > 0:
+                time_since_last_use = time.time() - last_used
+                if time_since_last_use >= unload_timeout:
+                    logger.info(f"Model inactive for {time_since_last_use:.1f}s, auto-unloading...")
+                    unload_model()
+
+
 # --- Background Worker for Inference ---
 
 def generation_worker():
@@ -269,6 +388,9 @@ def generation_worker():
             logger.info(f"Worker picked up task {task_id}.")
             tasks[task_id]["status"] = "running"
             start_time = time.time()
+
+            # Ensure model is loaded before processing
+            ensure_model_loaded()
 
             # --- Core Inference Logic ---
             scripts, speaker_numbers = parse_txt_script(script_content)
@@ -323,34 +445,44 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.on_event("startup")
 async def startup_event():
-    global model, processor, voice_mapper, selected_model
-    logger.info(f"Application startup: loading {selected_model.upper()} model...")
+    global model, processor, voice_mapper, selected_model, unload_monitor_thread, monitor_running
 
-    # Select model path based on CLI argument
-    if selected_model.lower() == "7b":
-        model_path = "WestZhang/VibeVoice-Large-pt"
-    else:
-        model_path = "microsoft/VibeVoice-1.5B"
+    logger.info(f"Application startup: initializing {selected_model.upper()} model configuration...")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    if model is None:
+    # Initialize voice mapper (doesn't require model)
+    if voice_mapper is None:
         voice_mapper = VoiceMapper(builtin_path="demo/voices", user_path="voices")
-        processor = VibeVoiceProcessor.from_pretrained(model_path)
-        model = VibeVoiceForConditionalGenerationInference.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device,
-            attn_implementation="sdpa"
-        )
-        model.eval()
-        model.set_ddpm_inference_steps(num_steps=10)
+
+    # Model will be loaded on first use (lazy loading)
+    # This allows the API to start quickly and load model only when needed
 
     # Start the background worker thread
     worker_thread = threading.Thread(target=generation_worker, daemon=True)
     worker_thread.start()
 
-    logger.info(f"{selected_model.upper()} model loaded and worker thread started.")
+    # Start the auto-unload monitor thread
+    monitor_running = True
+    unload_monitor_thread = threading.Thread(target=unload_monitor, daemon=True)
+    unload_monitor_thread.start()
+
+    logger.info(f"Application started. Model will be loaded on first request (auto-unload timeout: {unload_timeout}s).")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on application shutdown."""
+    global monitor_running, model
+
+    logger.info("Application shutting down...")
+
+    # Stop the monitor thread
+    monitor_running = False
+
+    # Unload model if loaded
+    if model is not None:
+        unload_model()
+
+    logger.info("Shutdown complete.")
 
 # --- Pydantic Models for API I/O ---
 
@@ -593,9 +725,16 @@ if __name__ == "__main__":
         default=8000,
         help="Port to bind to (default: 8000)"
     )
+    parser.add_argument(
+        "--unload-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds of inactivity before auto-unloading model (default: 10.0, set to 0 to disable)"
+    )
 
     args = parser.parse_args()
     selected_model = args.model.lower()
+    unload_timeout = args.unload_timeout
 
     # Ensure voices directory exists
     os.makedirs("voices", exist_ok=True)
