@@ -4,12 +4,16 @@ import time
 import uuid
 import queue
 import threading
+import argparse
 from typing import List, Tuple, Dict, Any, Optional
 
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+import numpy as np
+import librosa
+import soundfile as sf
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -37,36 +41,196 @@ model: Optional[VibeVoiceForConditionalGenerationInference] = None
 processor: Optional[VibeVoiceProcessor] = None
 voice_mapper: Optional[Any] = None
 tasks: Dict[str, Dict[str, Any]] = {}
+selected_model: str = "1.5b"  # Default model
 
-# --- Helper Classes (Unchanged) ---
+# --- Helper Classes ---
 
 class VoiceMapper:
-    def __init__(self, base_path: str = "demo/voices"):
-        self.voices_dir = base_path
+    def __init__(self, builtin_path: str = "demo/voices", user_path: str = "voices"):
+        self.builtin_path = builtin_path
+        self.user_path = user_path
         self.voice_presets = {}
         self.available_voices = {}
+        self.builtin_voices = set()
+        self.user_voices = set()
         self.setup_voice_presets()
 
     def setup_voice_presets(self):
-        if not os.path.exists(self.voices_dir):
-            logger.warning(f"Voices directory not found at {self.voices_dir}")
-            return
-        wav_files = [f for f in os.listdir(self.voices_dir) if f.lower().endswith('.wav')]
-        for wav_file in wav_files:
-            name = os.path.splitext(wav_file)[0]
-            self.voice_presets[name] = os.path.join(self.voices_dir, wav_file)
+        """Scan both built-in and user voice directories."""
+        self.voice_presets = {}
+        self.builtin_voices = set()
+        self.user_voices = set()
+
+        # Scan built-in voices directory
+        if os.path.exists(self.builtin_path):
+            wav_files = [f for f in os.listdir(self.builtin_path) if f.lower().endswith('.wav')]
+            for wav_file in wav_files:
+                name = os.path.splitext(wav_file)[0]
+                full_path = os.path.join(self.builtin_path, wav_file)
+                if os.path.exists(full_path):
+                    self.voice_presets[name] = full_path
+                    self.builtin_voices.add(name)
+            logger.info(f"Found {len(self.builtin_voices)} built-in voices in {self.builtin_path}")
+        else:
+            logger.warning(f"Built-in voices directory not found at {self.builtin_path}")
+
+        # Scan user voices directory
+        if os.path.exists(self.user_path):
+            wav_files = [f for f in os.listdir(self.user_path) if f.lower().endswith('.wav')]
+            for wav_file in wav_files:
+                name = os.path.splitext(wav_file)[0]
+                full_path = os.path.join(self.user_path, wav_file)
+                if os.path.exists(full_path):
+                    # User voices can override built-in voices with same name
+                    if name not in self.builtin_voices:
+                        self.voice_presets[name] = full_path
+                        self.user_voices.add(name)
+                    else:
+                        logger.warning(f"User voice '{name}' conflicts with built-in voice, skipping")
+            logger.info(f"Found {len(self.user_voices)} user voices in {self.user_path}")
+        else:
+            logger.info(f"User voices directory not found at {self.user_path}, will be created on first upload")
+
         self.available_voices = {n: p for n, p in self.voice_presets.items() if os.path.exists(p)}
-        logger.info(f"Found {len(self.available_voices)} voices in {self.voices_dir}")
+        logger.info(f"Total {len(self.available_voices)} voices available")
+
+    def reload(self):
+        """Reload voice presets from directories."""
+        self.setup_voice_presets()
+
+    def is_builtin_voice(self, voice_name: str) -> bool:
+        """Check if a voice is a built-in voice."""
+        return voice_name in self.builtin_voices
 
     def get_voice_path(self, speaker_name: str) -> str:
+        """Get voice file path for a speaker name."""
         # Exact and partial matching logic
-        if speaker_name in self.available_voices: return self.available_voices[speaker_name]
+        if speaker_name in self.available_voices:
+            return self.available_voices[speaker_name]
         speaker_lower = speaker_name.lower()
         for name, path in self.available_voices.items():
             if name.lower() in speaker_lower or speaker_lower in name.lower():
                 return path
-        if self.available_voices: return list(self.available_voices.values())[0]
+        if self.available_voices:
+            return list(self.available_voices.values())[0]
         raise ValueError("No voice presets available.")
+
+# --- Audio Processing Utility ---
+
+def process_voice_file(
+    input_file: UploadFile,
+    output_dir: str = "voices",
+    target_sr: int = 24000,
+    min_duration: float = 1.0,
+    max_duration: float = 30.0,
+    target_dB_FS: float = -25
+) -> Tuple[str, str]:
+    """
+    Process uploaded voice file to VibeVoice-compatible format.
+
+    Args:
+        input_file: Uploaded file object
+        output_dir: Directory to save processed file
+        target_sr: Target sampling rate (24000 Hz for VibeVoice)
+        min_duration: Minimum audio duration in seconds
+        max_duration: Maximum audio duration in seconds
+        target_dB_FS: Target dB FS for normalization
+
+    Returns:
+        Tuple of (voice_name, output_path)
+
+    Raises:
+        HTTPException: If file processing fails or validation fails
+    """
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Validate file extension
+    file_ext = os.path.splitext(input_file.filename)[1].lower()
+    if file_ext not in ['.mp3', '.wav']:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file format. Only MP3 and WAV files are supported. Got: {file_ext}"
+        )
+
+    # Generate voice name from filename or use provided name
+    voice_name = os.path.splitext(input_file.filename)[0]
+    # Sanitize voice name (remove special characters, spaces)
+    voice_name = re.sub(r'[^a-zA-Z0-9_-]', '_', voice_name)
+    if not voice_name:
+        voice_name = f"voice_{uuid.uuid4().hex[:8]}"
+
+    # Check if voice name already exists
+    output_path = os.path.join(output_dir, f"{voice_name}.wav")
+    if os.path.exists(output_path):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Voice name '{voice_name}' already exists. Please choose a different name."
+        )
+
+    # Save uploaded file temporarily
+    temp_path = os.path.join(output_dir, f"temp_{uuid.uuid4().hex[:8]}{file_ext}")
+    try:
+        with open(temp_path, "wb") as f:
+            content = input_file.file.read()
+            f.write(content)
+
+        # Load audio with librosa
+        try:
+            audio, sr = librosa.load(temp_path, sr=target_sr, mono=True)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to load audio file: {str(e)}"
+            )
+
+        # Validate duration
+        duration = len(audio) / target_sr
+        if duration < min_duration:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Audio duration ({duration:.2f}s) is too short. Minimum: {min_duration}s"
+            )
+        if duration > max_duration:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Audio duration ({duration:.2f}s) is too long. Maximum: {max_duration}s"
+            )
+
+        # Normalize audio (target_dB_FS: -25)
+        # Calculate RMS and normalize to target dB FS
+        rms = np.sqrt(np.mean(audio**2))
+        if rms > 1e-6:
+            target_linear = 10 ** (target_dB_FS / 20.0)
+            audio = audio * (target_linear / rms)
+
+        # Ensure audio is in valid range [-1, 1]
+        max_val = np.max(np.abs(audio))
+        if max_val > 1.0:
+            audio = audio / max_val
+
+        # Save as WAV file
+        sf.write(output_path, audio, target_sr)
+
+        logger.info(f"Processed voice file: {voice_name} ({duration:.2f}s, {target_sr}Hz, mono)")
+
+        return voice_name, output_path
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing voice file: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to process voice file: {str(e)}"
+        )
+    finally:
+        # Clean up temporary file
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
 
 def parse_txt_script(txt_content: str) -> Tuple[List[str], List[str]]:
     lines = txt_content.strip().split('\n')
@@ -100,7 +264,7 @@ def generation_worker():
         task_id, script_content, speaker_names, cfg_scale = task_queue.get()
         if task_id is None: # A way to stop the worker thread if needed.
             break
-        
+
         try:
             logger.info(f"Worker picked up task {task_id}.")
             tasks[task_id]["status"] = "running"
@@ -116,7 +280,7 @@ def generation_worker():
 
             name_map = {num: name for num, name in zip(unique_speakers, speaker_names)}
             voice_samples = [voice_mapper.get_voice_path(name_map[num]) for num in unique_speakers]
-            
+
             inputs = processor(
                 text=['\n'.join(scripts)],
                 voice_samples=[voice_samples],
@@ -129,21 +293,21 @@ def generation_worker():
                 verbose=False
             )
             # --- End Core Inference Logic ---
-            
+
             generation_time = time.time() - start_time
             logger.info(f"Task {task_id} finished in {generation_time:.2f}s")
-            
+
             output_dir = "api_outputs"
             os.makedirs(output_dir, exist_ok=True)
             output_path = os.path.join(output_dir, f"{task_id}.wav")
             processor.save_audio(outputs.speech_outputs[0], output_path=output_path)
-            
+
             tasks[task_id].update({
                 "status": "completed",
                 "result_path": output_path,
                 "generation_time": generation_time
             })
-            
+
         except Exception as e:
             logger.error(f"Task {task_id} failed: {e}", exc_info=True)
             if task_id in tasks:
@@ -159,14 +323,19 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 @app.on_event("startup")
 async def startup_event():
-    global model, processor, voice_mapper
-    logger.info("Application startup: loading models...")
-    
-    model_path = "microsoft/VibeVoice-1.5B"
+    global model, processor, voice_mapper, selected_model
+    logger.info(f"Application startup: loading {selected_model.upper()} model...")
+
+    # Select model path based on CLI argument
+    if selected_model.lower() == "7b":
+        model_path = "WestZhang/VibeVoice-Large-pt"
+    else:
+        model_path = "microsoft/VibeVoice-1.5B"
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if model is None:
-        voice_mapper = VoiceMapper(base_path="demo/voices")
+        voice_mapper = VoiceMapper(builtin_path="demo/voices", user_path="voices")
         processor = VibeVoiceProcessor.from_pretrained(model_path)
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             model_path,
@@ -176,12 +345,12 @@ async def startup_event():
         )
         model.eval()
         model.set_ddpm_inference_steps(num_steps=10)
-    
+
     # Start the background worker thread
     worker_thread = threading.Thread(target=generation_worker, daemon=True)
     worker_thread.start()
-    
-    logger.info("Models loaded and worker thread started.")
+
+    logger.info(f"{selected_model.upper()} model loaded and worker thread started.")
 
 # --- Pydantic Models for API I/O ---
 
@@ -212,14 +381,14 @@ async def generate_audio(request: Request, generation_request: GenerationRequest
     task_id = str(uuid.uuid4())
     queue_pos = task_queue.qsize() + 1
     tasks[task_id] = {"status": "queued", "queue_position": queue_pos}
-    
+
     task_queue.put((
         task_id,
         generation_request.script,
         generation_request.speaker_names,
         generation_request.cfg_scale
     ))
-    
+
     return {
         "task_id": task_id,
         "status": "queued",
@@ -232,7 +401,7 @@ async def get_task_status(task_id: str):
     task = tasks.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    
+
     # Dynamically update queue position if still queued
     if task["status"] == "queued":
         try:
@@ -243,7 +412,7 @@ async def get_task_status(task_id: str):
         except ValueError:
             # Task might have just been picked up, status will update soon
             task["queue_position"] = 0
-            
+
     return {"task_id": task_id, **task}
 
 @app.get("/result/{task_id}")
@@ -262,5 +431,173 @@ async def list_voices():
     if not voice_mapper: raise HTTPException(status_code=503, detail="VoiceMapper not initialized.")
     return list(voice_mapper.available_voices.keys())
 
+@app.post("/voices/upload")
+@limiter.limit("10/minute")
+async def upload_voice(
+    request: Request,
+    voice_file: UploadFile = File(..., description="Voice file (MP3 or WAV)"),
+    voice_name: Optional[str] = Form(None, description="Optional custom name for the voice")
+):
+    """
+    Upload and process a voice file for use in TTS generation.
+
+    The file will be converted to:
+    - WAV format
+    - 24000 Hz sampling rate
+    - Mono channel
+    - Normalized to -25 dB FS
+
+    Duration must be between 1-30 seconds.
+    """
+    if not voice_mapper:
+        raise HTTPException(status_code=503, detail="VoiceMapper not initialized.")
+
+    try:
+        # Process the voice file
+        processed_name, output_path = process_voice_file(voice_file)
+
+        # Use custom name if provided
+        if voice_name:
+            # Sanitize custom name
+            voice_name = re.sub(r'[^a-zA-Z0-9_-]', '_', voice_name)
+            if voice_name and voice_name != processed_name:
+                # Check if new name already exists
+                new_output_path = os.path.join("voices", f"{voice_name}.wav")
+                if os.path.exists(new_output_path):
+                    # Clean up the file we just created
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Voice name '{voice_name}' already exists."
+                    )
+                # Rename the file
+                try:
+                    os.rename(output_path, new_output_path)
+                    processed_name = voice_name
+                    output_path = new_output_path
+                except OSError as e:
+                    # If rename fails, clean up
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to rename voice file: {str(e)}"
+                    )
+
+        # Reload voice mapper to include new voice
+        voice_mapper.reload()
+
+        return JSONResponse(
+            status_code=201,
+            content={
+                "message": "Voice uploaded successfully",
+                "voice_name": processed_name,
+                "file_path": output_path
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading voice: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to upload voice: {str(e)}")
+
+@app.delete("/voices/{voice_name}")
+async def delete_voice(voice_name: str):
+    """
+    Delete a user-uploaded voice from the system.
+
+    Built-in voices cannot be deleted.
+    """
+    if not voice_mapper:
+        raise HTTPException(status_code=503, detail="VoiceMapper not initialized.")
+
+    # Check if voice exists
+    if voice_name not in voice_mapper.available_voices:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Voice not found: {voice_name}"
+        )
+
+    # Check if it's a built-in voice
+    if voice_mapper.is_builtin_voice(voice_name):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete built-in voice. Only user-created voices can be deleted."
+        )
+
+    # Get the voice file path
+    voice_path = voice_mapper.available_voices[voice_name]
+
+    # Verify it's in the user voices directory (not built-in)
+    # Normalize paths for comparison
+    user_voices_dir = os.path.abspath("voices")
+    voice_path_abs = os.path.abspath(voice_path)
+    builtin_voices_dir = os.path.abspath("demo/voices")
+
+    if not voice_path_abs.startswith(user_voices_dir) or voice_path_abs.startswith(builtin_voices_dir):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot delete built-in voice. Only user-created voices can be deleted."
+        )
+
+    # Delete the file
+    files_deleted = []
+    try:
+        if os.path.exists(voice_path):
+            os.remove(voice_path)
+            files_deleted.append(voice_path)
+            logger.info(f"Deleted voice: {voice_name} from {voice_path}")
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice file not found: {voice_path}"
+            )
+    except OSError as e:
+        logger.error(f"Error deleting voice file: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete voice file: {str(e)}"
+        )
+
+    # Reload voice mapper to remove deleted voice
+    voice_mapper.reload()
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": "Voice deleted successfully",
+            "voice_name": voice_name,
+            "files_deleted": files_deleted
+        }
+    )
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    parser = argparse.ArgumentParser(description="VibeVoice FastAPI Server")
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["1.5b", "7b"],
+        default="1.5b",
+        help="Model to use: 1.5b (default) or 7b"
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="0.0.0.0",
+        help="Host to bind to (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port to bind to (default: 8000)"
+    )
+
+    args = parser.parse_args()
+    selected_model = args.model.lower()
+
+    # Ensure voices directory exists
+    os.makedirs("voices", exist_ok=True)
+
+    uvicorn.run(app, host=args.host, port=args.port)
