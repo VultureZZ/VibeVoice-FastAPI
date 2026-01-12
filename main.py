@@ -289,6 +289,9 @@ def load_model(model_name: str = None, _lock_acquired: bool = False):
         # Select model path based on model name
         if model_to_load == "7b":
             model_path = "WestZhang/VibeVoice-Large-pt"
+            print("WARNING: Attempting to load 7B model from WestZhang/VibeVoice-Large-pt", flush=True)
+            print("This model may not be publicly available on Hugging Face.", flush=True)
+            print("If loading fails, please use --model 1.5b for the publicly available 1.5B model.", flush=True)
         else:
             model_path = "microsoft/VibeVoice-1.5B"
 
@@ -339,9 +342,24 @@ def ensure_model_loaded():
                 # Pass _lock_acquired=True since we already hold the lock
                 load_model(_lock_acquired=True)
             except Exception as e:
-                print(f"Failed to load model: {e}", flush=True)
-                logger.error(f"Failed to load model: {e}", exc_info=True)
-                raise
+                error_msg = str(e)
+                # Provide helpful error message for 7B model not found
+                if "WestZhang/VibeVoice-Large-pt" in error_msg or "404" in error_msg or "not a valid model identifier" in error_msg or "Repository Not Found" in error_msg:
+                    print("\n" + "="*80, flush=True)
+                    print("ERROR: The 7B model is not available on Hugging Face.", flush=True)
+                    print("="*80, flush=True)
+                    print("The model 'WestZhang/VibeVoice-Large-pt' does not exist or is not publicly accessible.", flush=True)
+                    print("\nPlease use the 1.5B model instead:", flush=True)
+                    print("  python main.py --model 1.5b --port 8008", flush=True)
+                    print("="*80 + "\n", flush=True)
+                    raise ValueError(
+                        "7B model not available. Please use --model 1.5b instead. "
+                        "The model 'WestZhang/VibeVoice-Large-pt' is not available on Hugging Face."
+                    ) from e
+                else:
+                    print(f"Failed to load model: {error_msg}", flush=True)
+                    logger.error(f"Failed to load model: {error_msg}", exc_info=True)
+                    raise
         else:
             last_used = time.time()
 
@@ -758,7 +776,7 @@ if __name__ == "__main__":
         type=str,
         choices=["1.5b", "7b"],
         default="1.5b",
-        help="Model to use: 1.5b (default) or 7b"
+        help="Model to use: 1.5b (default) or 7b. Note: 7B model may not be publicly available on Hugging Face."
     )
     parser.add_argument(
         "--host",
