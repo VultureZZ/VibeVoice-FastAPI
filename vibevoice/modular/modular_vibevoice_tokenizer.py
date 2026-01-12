@@ -1047,9 +1047,10 @@ class VibeVoiceAcousticTokenizerModel(PreTrainedModel):
         decoder_config = copy.deepcopy(config)
         decoder_config.dimension = config.vae_dim
         decoder_config.n_filters = config.decoder_n_filters
-        # Reverse decoder ratios to mirror encoder's reversed ratios for proper symmetry
-        # Encoder reverses ratios internally, so decoder needs reversed ratios to match
-        decoder_config.ratios = list(reversed(config.decoder_ratios))
+        # Note: Decoder uses ratios directly (not reversed) to match pretrained model weights
+        # The encoder reverses ratios internally, but the pretrained model was trained
+        # with this configuration, so we must match it for compatibility
+        decoder_config.ratios = config.decoder_ratios
         decoder_config.depths = decoder_depths
         decoder_config.norm = config.conv_norm
         decoder_config.pad_mode = config.pad_mode

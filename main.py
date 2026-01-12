@@ -287,11 +287,18 @@ def load_model(model_name: str = None, _lock_acquired: bool = False):
         logger.info(f"Loading {model_to_load.upper()} model...")
 
         # Select model path based on model name
+        # Available models:
+        # - 1.5b: microsoft/VibeVoice-1.5B (publicly available)
+        # - realtime: microsoft/VibeVoice-Realtime-0.5B (streaming, single speaker)
+        # Note: The 7B model (WestZhang/VibeVoice-Large-pt) is no longer available
         if model_to_load == "7b":
-            model_path = "WestZhang/VibeVoice-Large-pt"
-            print("WARNING: Attempting to load 7B model from WestZhang/VibeVoice-Large-pt", flush=True)
-            print("This model may not be publicly available on Hugging Face.", flush=True)
-            print("If loading fails, please use --model 1.5b for the publicly available 1.5B model.", flush=True)
+            raise ValueError(
+                "The 7B model (WestZhang/VibeVoice-Large-pt) is no longer available on Hugging Face. "
+                "Please use --model 1.5b for the 1.5B model, or --model realtime for the realtime streaming model."
+            )
+        elif model_to_load == "realtime":
+            model_path = "microsoft/VibeVoice-Realtime-0.5B"
+            print("WARNING: Realtime model supports single speaker only (no multi-speaker conversations).", flush=True)
         else:
             model_path = "microsoft/VibeVoice-1.5B"
 
@@ -774,9 +781,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model",
         type=str,
-        choices=["1.5b", "7b"],
+        choices=["1.5b", "realtime"],
         default="1.5b",
-        help="Model to use: 1.5b (default) or 7b. Note: 7B model may not be publicly available on Hugging Face."
+        help="Model to use: 1.5b (default, multi-speaker) or realtime (streaming, single speaker only). Note: 7B model is no longer available."
     )
     parser.add_argument(
         "--host",

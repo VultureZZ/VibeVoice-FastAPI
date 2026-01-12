@@ -79,8 +79,8 @@ pip install -e .
 # Basic usage (defaults to 1.5B model, port 8000)
 python main.py
 
-# Use the 7B model
-python main.py --model 7b
+# Use the Realtime model (streaming, single speaker only)
+python main.py --model realtime
 
 # Custom host and port
 python main.py --host 0.0.0.0 --port 8008
@@ -109,7 +109,9 @@ The API will be available at `http://localhost:8000` with interactive documentat
 | Model | Context Length | Generation Length | Hugging Face |
 |-------|----------------|-------------------|--------------|
 | VibeVoice-1.5B | 64K | ~90 min | [microsoft/VibeVoice-1.5B](https://huggingface.co/microsoft/VibeVoice-1.5B) |
-| VibeVoice-7B-Preview | 32K | ~45 min | [WestZhang/VibeVoice-Large-pt](https://huggingface.co/WestZhang/VibeVoice-Large-pt) |
+| VibeVoice-Realtime-0.5B | - | Streaming | [microsoft/VibeVoice-Realtime-0.5B](https://huggingface.co/microsoft/VibeVoice-Realtime-0.5B) |
+
+**Note:** The 7B model is no longer available on Hugging Face. The Realtime model supports streaming text input and single-speaker generation only.
 
 ### Endpoints
 
@@ -323,7 +325,7 @@ Current limit: 10 requests per minute per IP. Modify in `main.py`:
 ### Chinese Speech Stability
 For optimal Chinese speech generation:
 - Use English punctuation (commas and periods only)
-- Consider using the 7B model for better stability
+- The 1.5B model provides good stability for both English and Chinese
 - Avoid special Chinese quotation marks
 
 ### Background Music
