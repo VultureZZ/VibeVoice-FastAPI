@@ -24,6 +24,7 @@ from slowapi.errors import RateLimitExceeded
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from transformers.utils import logging
+from transformers import GenerationConfig
 
 # --- Setup & Configuration ---
 
@@ -819,11 +820,34 @@ def generation_worker():
             with model_lock:
                 last_used = time.time()
 
-            outputs = model.generate(
-                **inputs, max_new_tokens=None, cfg_scale=cfg_scale,
-                tokenizer=processor.tokenizer, generation_config={'do_sample': False},
-                verbose=False
-            )
+            print(f"Starting generation for task {task_id}...", flush=True)
+            logger.info(f"Starting generation for task {task_id}...")
+            
+            try:
+                # Create generation config with no max_length limit to ensure full generation
+                # Use a very high max_length to prevent early stopping (VibeVoice uses max_length, not max_new_tokens)
+                gen_config = GenerationConfig(
+                    do_sample=False,
+                    max_length=1000000,  # Very high limit to prevent early stopping
+                )
+                
+                print(f"Generation config: max_length={gen_config.max_length}, do_sample={gen_config.do_sample}", flush=True)
+                logger.info(f"Generation config: max_length={gen_config.max_length}, do_sample={gen_config.do_sample}")
+                
+                outputs = model.generate(
+                    **inputs, 
+                    cfg_scale=cfg_scale,
+                    tokenizer=processor.tokenizer, 
+                    generation_config=gen_config,
+                    verbose=False
+                )
+                print(f"Generation completed for task {task_id}", flush=True)
+                logger.info(f"Generation completed for task {task_id}")
+            except Exception as gen_error:
+                print(f"Error during generation for task {task_id}: {gen_error}", flush=True)
+                logger.error(f"Error during generation for task {task_id}: {gen_error}", exc_info=True)
+                raise
+            
             # --- End Core Inference Logic ---
 
             # Update last_used when generation completes to prevent premature unloading
@@ -832,11 +856,27 @@ def generation_worker():
 
             generation_time = time.time() - start_time
             logger.info(f"Task {task_id} finished in {generation_time:.2f}s")
+            
+            # Verify outputs are valid
+            if outputs is None:
+                raise ValueError("Generation returned None")
+            if not hasattr(outputs, 'speech_outputs') or outputs.speech_outputs is None:
+                raise ValueError("Generation outputs missing speech_outputs")
+            if len(outputs.speech_outputs) == 0:
+                raise ValueError("Generation outputs has empty speech_outputs")
+            if outputs.speech_outputs[0] is None:
+                raise ValueError("Generation outputs speech_outputs[0] is None")
+            
+            print(f"Saving audio for task {task_id}...", flush=True)
+            logger.info(f"Saving audio for task {task_id}...")
 
             output_dir = "api_outputs"
             os.makedirs(output_dir, exist_ok=True)
             output_path = os.path.join(output_dir, f"{task_id}.wav")
             processor.save_audio(outputs.speech_outputs[0], output_path=output_path)
+            
+            print(f"Audio saved for task {task_id} at {output_path}", flush=True)
+            logger.info(f"Audio saved for task {task_id} at {output_path}")
 
             tasks[task_id].update({
                 "status": "completed",
