@@ -827,7 +827,6 @@ def generation_worker():
             # --- End Core Inference Logic ---
 
             # Update last_used when generation completes to prevent premature unloading
-            global last_used
             with model_lock:
                 last_used = time.time()
 
