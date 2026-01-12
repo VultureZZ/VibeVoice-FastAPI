@@ -24,7 +24,6 @@ from slowapi.errors import RateLimitExceeded
 from vibevoice.modular.modeling_vibevoice_inference import VibeVoiceForConditionalGenerationInference
 from vibevoice.processor.vibevoice_processor import VibeVoiceProcessor
 from transformers.utils import logging
-from transformers import GenerationConfig
 
 # --- Setup & Configuration ---
 
@@ -824,21 +823,21 @@ def generation_worker():
             logger.info(f"Starting generation for task {task_id}...")
             
             try:
-                # Create generation config with no max_length limit to ensure full generation
+                # Create generation config as a dictionary to prevent early stopping
                 # Use a very high max_length to prevent early stopping (VibeVoice uses max_length, not max_new_tokens)
-                gen_config = GenerationConfig(
-                    do_sample=False,
-                    max_length=1000000,  # Very high limit to prevent early stopping
-                )
+                gen_config_dict = {
+                    'do_sample': False,
+                    'max_length': 1000000,  # Very high limit to prevent early stopping
+                }
                 
-                print(f"Generation config: max_length={gen_config.max_length}, do_sample={gen_config.do_sample}", flush=True)
-                logger.info(f"Generation config: max_length={gen_config.max_length}, do_sample={gen_config.do_sample}")
+                print(f"Generation config: max_length={gen_config_dict['max_length']}, do_sample={gen_config_dict['do_sample']}", flush=True)
+                logger.info(f"Generation config: max_length={gen_config_dict['max_length']}, do_sample={gen_config_dict['do_sample']}")
                 
                 outputs = model.generate(
                     **inputs, 
                     cfg_scale=cfg_scale,
                     tokenizer=processor.tokenizer, 
-                    generation_config=gen_config,
+                    generation_config=gen_config_dict,
                     verbose=False
                 )
                 print(f"Generation completed for task {task_id}", flush=True)
