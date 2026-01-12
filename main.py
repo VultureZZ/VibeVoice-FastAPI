@@ -685,8 +685,9 @@ def unload_monitor():
     """
     Background thread that monitors model usage and unloads after timeout.
     Only unloads if timeout > 0 (0 means disabled).
+    Checks for active tasks before unloading to prevent unloading during generation.
     """
-    global monitor_running, last_used, unload_timeout, model
+    global monitor_running, last_used, unload_timeout, model, tasks
 
     print(f"Model auto-unload monitor started (timeout: {unload_timeout}s)", flush=True)
     logger.info(f"Model auto-unload monitor started (timeout: {unload_timeout}s)")
@@ -698,21 +699,27 @@ def unload_monitor():
         if unload_timeout <= 0:
             continue
 
+        # Check if there are any active tasks (running or loading_model)
+        has_active_tasks = False
         with model_lock:
-            # Only check if model is loaded and has been used at least once
             if model is not None and last_used > 0:
-                time_since_last_use = time.time() - last_used
-                if time_since_last_use >= unload_timeout:
-                    print(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...", flush=True)
-                    logger.info(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...")
-                    # unload_model() will handle the lock, but we're already in the lock
-                    # So we need to call it carefully - actually, unload_model acquires its own lock
-                    # We need to release our lock first
-                    pass
+                # Check if any tasks are currently running or loading
+                for task_id, task_info in tasks.items():
+                    if task_info.get("status") in ["running", "loading_model"]:
+                        has_active_tasks = True
+                        break
 
-        # Release lock before calling unload_model (it acquires its own lock)
-        # Actually, we should call unload_model outside the lock
-        if model is not None and last_used > 0:
+                # Only proceed with unload check if no active tasks
+                if not has_active_tasks:
+                    time_since_last_use = time.time() - last_used
+                    if time_since_last_use >= unload_timeout:
+                        print(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...", flush=True)
+                        logger.info(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...")
+                        # Release lock before calling unload_model (it acquires its own lock)
+                        pass
+
+        # Call unload_model outside the lock if conditions are met
+        if model is not None and last_used > 0 and not has_active_tasks:
             time_since_last_use = time.time() - last_used
             if time_since_last_use >= unload_timeout:
                 unload_model()
