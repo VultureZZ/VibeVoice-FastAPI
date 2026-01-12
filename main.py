@@ -340,16 +340,22 @@ def load_model(model_name: str = None, _lock_acquired: bool = False):
 
 
 def ensure_model_loaded():
-    """Ensure the model is loaded before use."""
+    """Ensure the model is loaded before use. Reloads if it was previously unloaded."""
     global model, last_used
 
     with model_lock:
+        # Check if model needs to be loaded
         if model is None:
+            print("Model is not loaded, loading now...", flush=True)
+            logger.info("Model is not loaded, loading now...")
             try:
                 # Pass _lock_acquired=True since we already hold the lock
                 load_model(_lock_acquired=True)
+                print("Model loaded successfully in ensure_model_loaded().", flush=True)
+                logger.info("Model loaded successfully in ensure_model_loaded().")
             except Exception as e:
                 error_msg = str(e)
+                print(f"Failed to load model in ensure_model_loaded(): {error_msg}", flush=True)
                 # Provide helpful error message for 7B model not found
                 if "WestZhang/VibeVoice-Large-pt" in error_msg or "404" in error_msg or "not a valid model identifier" in error_msg or "Repository Not Found" in error_msg:
                     print("\n" + "="*80, flush=True)
@@ -368,12 +374,15 @@ def ensure_model_loaded():
                     logger.error(f"Failed to load model: {error_msg}", exc_info=True)
                     raise
         else:
+            # Model is already loaded, just update last_used timestamp
             last_used = time.time()
+            print(f"Model already loaded, updated last_used timestamp.", flush=True)
 
 
 def unload_model():
     """
     Fully unload the model and processor, clearing GPU memory.
+    This aggressively releases all GPU memory to ensure NVRAM is fully freed.
     """
     global model, processor, last_used
 
@@ -386,25 +395,70 @@ def unload_model():
         print("Unloading model and clearing GPU memory...", flush=True)
         logger.info("Unloading model and clearing GPU memory...")
 
-        # Move model to CPU and delete
-        if hasattr(model, 'cpu'):
-            model = model.cpu()
+        # Recursively move all model components to CPU
+        # This is important when using device_map which may split model across devices
+        if model is not None:
+            try:
+                # Move entire model to CPU
+                if hasattr(model, 'to'):
+                    model = model.to('cpu')
+                elif hasattr(model, 'cpu'):
+                    model = model.cpu()
 
-        # Delete model and processor
-        del model
-        del processor
+                # Recursively move all submodules to CPU
+                if hasattr(model, 'modules'):
+                    for module in model.modules():
+                        if hasattr(module, 'to'):
+                            try:
+                                module.to('cpu')
+                            except:
+                                pass
+            except Exception as e:
+                print(f"Warning: Error moving model to CPU: {e}", flush=True)
+                logger.warning(f"Error moving model to CPU: {e}")
 
-        # Clear PyTorch cache
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            # Force garbage collection
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Delete model and processor references
+        model_to_delete = model
+        processor_to_delete = processor
 
+        # Set globals to None first to prevent any new references
         model = None
         processor = None
         last_used = 0.0
+
+        # Now delete the actual objects
+        del model_to_delete
+        del processor_to_delete
+
+        # Aggressively clear GPU memory
+        if torch.cuda.is_available():
+            # Synchronize all CUDA operations
+            torch.cuda.synchronize()
+
+            # Clear cache multiple times
+            for _ in range(3):
+                torch.cuda.empty_cache()
+
+            # Force garbage collection multiple times
+            for _ in range(3):
+                gc.collect()
+
+            # Final cache clear
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+            # Try to reset peak memory stats (if available)
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except:
+                pass
+
+            # Print memory info for debugging
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"GPU memory after unload - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB", flush=True)
+                logger.info(f"GPU memory after unload - Allocated: {allocated:.2f} GB, Reserved: {reserved:.2f} GB")
 
         print("Model unloaded and GPU memory cleared.", flush=True)
         logger.info("Model unloaded and GPU memory cleared.")
@@ -413,8 +467,9 @@ def unload_model():
 def unload_monitor():
     """
     Background thread that monitors model usage and unloads after timeout.
+    Only unloads if timeout > 0 (0 means disabled).
     """
-    global monitor_running, last_used, unload_timeout
+    global monitor_running, last_used, unload_timeout, model
 
     print(f"Model auto-unload monitor started (timeout: {unload_timeout}s)", flush=True)
     logger.info(f"Model auto-unload monitor started (timeout: {unload_timeout}s)")
@@ -422,13 +477,28 @@ def unload_monitor():
     while monitor_running:
         time.sleep(1.0)  # Check every second
 
+        # Skip unload check if timeout is 0 (disabled)
+        if unload_timeout <= 0:
+            continue
+
         with model_lock:
+            # Only check if model is loaded and has been used at least once
             if model is not None and last_used > 0:
                 time_since_last_use = time.time() - last_used
                 if time_since_last_use >= unload_timeout:
-                    print(f"Model inactive for {time_since_last_use:.1f}s, auto-unloading...", flush=True)
-                    logger.info(f"Model inactive for {time_since_last_use:.1f}s, auto-unloading...")
-                    unload_model()
+                    print(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...", flush=True)
+                    logger.info(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...")
+                    # unload_model() will handle the lock, but we're already in the lock
+                    # So we need to call it carefully - actually, unload_model acquires its own lock
+                    # We need to release our lock first
+                    pass
+
+        # Release lock before calling unload_model (it acquires its own lock)
+        # Actually, we should call unload_model outside the lock
+        if model is not None and last_used > 0:
+            time_since_last_use = time.time() - last_used
+            if time_since_last_use >= unload_timeout:
+                unload_model()
 
 
 # --- Background Worker for Inference ---
