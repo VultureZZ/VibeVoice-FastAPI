@@ -700,29 +700,56 @@ def unload_monitor():
             continue
 
         # Check if there are any active tasks (running or loading_model)
-        has_active_tasks = False
+        # We need to check this atomically with the unload decision
+        should_unload = False
         with model_lock:
             if model is not None and last_used > 0:
                 # Check if any tasks are currently running or loading
-                for task_id, task_info in tasks.items():
-                    if task_info.get("status") in ["running", "loading_model"]:
+                # This is the most important check - if ANY task is running, never unload
+                has_active_tasks = False
+                for task_id, task_info in list(tasks.items()):  # Use list() to avoid dict size changes
+                    status = task_info.get("status")
+                    if status in ["running", "loading_model"]:
                         has_active_tasks = True
+                        # Log to help debug if needed
+                        logger.debug(f"Found active task {task_id} with status {status}, preventing unload")
                         break
 
                 # Only proceed with unload check if no active tasks
                 if not has_active_tasks:
-                    time_since_last_use = time.time() - last_used
-                    if time_since_last_use >= unload_timeout:
-                        print(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...", flush=True)
-                        logger.info(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...")
-                        # Release lock before calling unload_model (it acquires its own lock)
-                        pass
+                    # Also check if there are any queued tasks waiting
+                    has_queued_tasks = task_queue.qsize() > 0
+                    
+                    if not has_queued_tasks:
+                        time_since_last_use = time.time() - last_used
+                        if time_since_last_use >= unload_timeout:
+                            # Double-check for active tasks right before deciding to unload
+                            # This prevents race conditions where a task might have just started
+                            # We check multiple times to be absolutely sure
+                            has_active_tasks_final = False
+                            for task_id, task_info in list(tasks.items()):  # Use list() to avoid dict size changes during iteration
+                                status = task_info.get("status")
+                                if status in ["running", "loading_model"]:
+                                    has_active_tasks_final = True
+                                    logger.info(f"Found active task {task_id} with status {status}, preventing unload")
+                                    break
+                            
+                            # Also check queue one more time
+                            has_queued_tasks_final = task_queue.qsize() > 0
+                            
+                            if not has_active_tasks_final and not has_queued_tasks_final:
+                                should_unload = True
+                                print(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...", flush=True)
+                                logger.info(f"Model inactive for {time_since_last_use:.1f}s (timeout: {unload_timeout}s), auto-unloading...")
+                            else:
+                                if has_active_tasks_final:
+                                    logger.debug(f"Prevented unload: found active tasks")
+                                if has_queued_tasks_final:
+                                    logger.debug(f"Prevented unload: found {has_queued_tasks_final} queued tasks")
 
-        # Call unload_model outside the lock if conditions are met
-        if model is not None and last_used > 0 and not has_active_tasks:
-            time_since_last_use = time.time() - last_used
-            if time_since_last_use >= unload_timeout:
-                unload_model()
+        # Call unload_model outside the lock if we decided to unload
+        if should_unload:
+            unload_model()
 
 
 # --- Background Worker for Inference ---
@@ -787,12 +814,22 @@ def generation_worker():
                 padding=True, return_tensors="pt", return_attention_mask=True
             )
 
+            # Update last_used right before generation to prevent premature unloading
+            global last_used
+            with model_lock:
+                last_used = time.time()
+
             outputs = model.generate(
                 **inputs, max_new_tokens=None, cfg_scale=cfg_scale,
                 tokenizer=processor.tokenizer, generation_config={'do_sample': False},
                 verbose=False
             )
             # --- End Core Inference Logic ---
+
+            # Update last_used when generation completes to prevent premature unloading
+            global last_used
+            with model_lock:
+                last_used = time.time()
 
             generation_time = time.time() - start_time
             logger.info(f"Task {task_id} finished in {generation_time:.2f}s")
