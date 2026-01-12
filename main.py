@@ -128,7 +128,7 @@ def process_voice_file(
     output_dir: str = "voices",
     target_sr: int = 24000,
     min_duration: float = 1.0,
-    max_duration: float = 30.0,
+    max_file_size: int = 25 * 1024 * 1024,  # 25MB in bytes
     target_dB_FS: float = -25
 ) -> Tuple[str, str]:
     """
@@ -139,7 +139,7 @@ def process_voice_file(
         output_dir: Directory to save processed file
         target_sr: Target sampling rate (24000 Hz for VibeVoice)
         min_duration: Minimum audio duration in seconds
-        max_duration: Maximum audio duration in seconds
+        max_file_size: Maximum file size in bytes (default: 25MB)
         target_dB_FS: Target dB FS for normalization
 
     Returns:
@@ -156,7 +156,23 @@ def process_voice_file(
     if file_ext not in ['.mp3', '.wav']:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid file format. Only MP3 and WAV files are supported. Got: {file_ext}"
+            detail={
+                "error": "Invalid file format",
+                "message": f"Only MP3 and WAV files are supported. Got: {file_ext}"
+            }
+        )
+
+    # Check file size before reading
+    # Read content to check size (we'll use it later anyway)
+    content = input_file.file.read()
+    file_size = len(content)
+    if file_size > max_file_size:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "File size exceeds limit",
+                "message": f"File size ({file_size / (1024*1024):.2f}MB) exceeds 25MB limit"
+            }
         )
 
     # Generate voice name from filename or use provided name
@@ -171,14 +187,16 @@ def process_voice_file(
     if os.path.exists(output_path):
         raise HTTPException(
             status_code=409,
-            detail=f"Voice name '{voice_name}' already exists. Please choose a different name."
+            detail={
+                "error": "Voice name already exists",
+                "message": f"A voice with this name already exists"
+            }
         )
 
     # Save uploaded file temporarily
     temp_path = os.path.join(output_dir, f"temp_{uuid.uuid4().hex[:8]}{file_ext}")
     try:
         with open(temp_path, "wb") as f:
-            content = input_file.file.read()
             f.write(content)
 
         # Load audio with librosa
@@ -187,20 +205,21 @@ def process_voice_file(
         except Exception as e:
             raise HTTPException(
                 status_code=400,
-                detail=f"Failed to load audio file: {str(e)}"
+                detail={
+                    "error": "Failed to load audio file",
+                    "message": str(e)
+                }
             )
 
-        # Validate duration
+        # Validate minimum duration
         duration = len(audio) / target_sr
         if duration < min_duration:
             raise HTTPException(
                 status_code=400,
-                detail=f"Audio duration ({duration:.2f}s) is too short. Minimum: {min_duration}s"
-            )
-        if duration > max_duration:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Audio duration ({duration:.2f}s) is too long. Maximum: {max_duration}s"
+                detail={
+                    "error": "Audio duration too short",
+                    "message": f"Audio duration ({duration:.2f}s) is too short. Minimum: {min_duration}s"
+                }
             )
 
         # Normalize audio (target_dB_FS: -25)
@@ -228,7 +247,10 @@ def process_voice_file(
         logger.error(f"Error processing voice file: {e}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to process voice file: {str(e)}"
+            detail={
+                "error": "Internal server error",
+                "message": "An error occurred while processing the voice file"
+            }
         )
     finally:
         # Clean up temporary file
@@ -237,6 +259,204 @@ def process_voice_file(
                 os.remove(temp_path)
             except:
                 pass
+
+def process_multiple_voice_files(
+    input_files: List[UploadFile],
+    voice_name: str,
+    output_dir: str = "voices",
+    target_sr: int = 24000,
+    min_duration: float = 1.0,
+    max_file_size: int = 25 * 1024 * 1024,  # 25MB in bytes
+    target_dB_FS: float = -25
+) -> Tuple[str, str]:
+    """
+    Process multiple uploaded voice files and combine them into a single voice file.
+
+    Args:
+        input_files: List of uploaded file objects
+        voice_name: Name for the combined voice
+        output_dir: Directory to save processed file
+        target_sr: Target sampling rate (24000 Hz for VibeVoice)
+        min_duration: Minimum total audio duration in seconds
+        max_file_size: Maximum file size per file in bytes (default: 25MB)
+        target_dB_FS: Target dB FS for normalization
+
+    Returns:
+        Tuple of (voice_name, output_path)
+
+    Raises:
+        HTTPException: If file processing fails or validation fails
+    """
+    if not input_files:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "No files provided",
+                "message": "At least one voice file is required"
+            }
+        )
+
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Sanitize voice name
+    voice_name = re.sub(r'[^a-zA-Z0-9_-]', '_', voice_name)
+    if not voice_name:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Invalid voice name",
+                "message": "Voice name cannot be empty"
+            }
+        )
+
+    # Check if voice name already exists
+    output_path = os.path.join(output_dir, f"{voice_name}.wav")
+    if os.path.exists(output_path):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Voice name already exists",
+                "message": "A voice with this name already exists"
+            }
+        )
+
+    # Validate all files before processing
+    temp_paths = []
+    audio_segments = []
+    total_duration = 0.0
+
+    try:
+        for idx, input_file in enumerate(input_files):
+            # Validate file extension
+            file_ext = os.path.splitext(input_file.filename)[1].lower()
+            if file_ext not in ['.mp3', '.wav']:
+                # Clean up any temp files created so far
+                for temp_path in temp_paths:
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except:
+                            pass
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Invalid file format",
+                        "message": f"Only MP3 and WAV files are supported. File {idx + 1} has invalid format: {file_ext}"
+                    }
+                )
+
+            # Read and validate file size
+            content = input_file.file.read()
+            file_size = len(content)
+            if file_size > max_file_size:
+                # Clean up any temp files created so far
+                for temp_path in temp_paths:
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except:
+                            pass
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "File size exceeds limit",
+                        "message": f"File {idx + 1} size ({file_size / (1024*1024):.2f}MB) exceeds 25MB limit"
+                    }
+                )
+
+            # Save temporarily
+            temp_path = os.path.join(output_dir, f"temp_{uuid.uuid4().hex[:8]}{file_ext}")
+            temp_paths.append(temp_path)
+            with open(temp_path, "wb") as f:
+                f.write(content)
+
+            # Load audio with librosa
+            try:
+                audio, sr = librosa.load(temp_path, sr=target_sr, mono=True)
+                duration = len(audio) / target_sr
+                total_duration += duration
+                audio_segments.append(audio)
+            except Exception as e:
+                # Clean up any temp files created so far
+                for temp_path in temp_paths:
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except:
+                            pass
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Failed to load audio file",
+                        "message": f"Failed to load file {idx + 1}: {str(e)}"
+                    }
+                )
+
+        # Validate total duration
+        if total_duration < min_duration:
+            # Clean up temp files
+            for temp_path in temp_paths:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Audio duration too short",
+                    "message": f"Combined audio duration ({total_duration:.2f}s) is too short. Minimum: {min_duration}s"
+                }
+            )
+
+        # Concatenate all audio segments
+        combined_audio = np.concatenate(audio_segments) if len(audio_segments) > 1 else audio_segments[0]
+
+        # Normalize combined audio (target_dB_FS: -25)
+        rms = np.sqrt(np.mean(combined_audio**2))
+        if rms > 1e-6:
+            target_linear = 10 ** (target_dB_FS / 20.0)
+            combined_audio = combined_audio * (target_linear / rms)
+
+        # Ensure audio is in valid range [-1, 1]
+        max_val = np.max(np.abs(combined_audio))
+        if max_val > 1.0:
+            combined_audio = combined_audio / max_val
+
+        # Save as WAV file
+        sf.write(output_path, combined_audio, target_sr)
+
+        logger.info(f"Processed {len(input_files)} voice file(s) into {voice_name} ({total_duration:.2f}s, {target_sr}Hz, mono)")
+
+        return voice_name, output_path
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing multiple voice files: {e}", exc_info=True)
+        # Clean up temp files on error
+        for temp_path in temp_paths:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Internal server error",
+                "message": "An error occurred while processing the voice files"
+            }
+        )
+    finally:
+        # Clean up temporary files
+        for temp_path in temp_paths:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
 
 def parse_txt_script(txt_content: str) -> Tuple[List[str], List[str]]:
     lines = txt_content.strip().split('\n')
@@ -706,64 +926,56 @@ async def list_voices():
 @limiter.limit("10/minute")
 async def upload_voice(
     request: Request,
-    voice_file: UploadFile = File(..., description="Voice file (MP3 or WAV)"),
-    voice_name: Optional[str] = Form(None, description="Optional custom name for the voice")
+    voice_file: List[UploadFile] = File(..., description="Voice file(s) (MP3 or WAV). Multiple files can be sent by appending multiple files with the same field name."),
+    voice_name: str = Form(..., description="Name for the voice (e.g., 'en-John_man', 'my_custom_voice')")
 ):
     """
-    Upload and process a voice file for use in TTS generation.
+    Upload and process custom voice file(s) for use in TTS generation.
 
-    The file will be converted to:
+    Supports multiple files - they will be combined into a single voice file.
+    Each file must be:
+    - MP3 or WAV format
+    - Maximum 25MB per file
+    - Minimum 1 second duration (combined)
+
+    The file(s) will be converted to:
     - WAV format
     - 24000 Hz sampling rate
     - Mono channel
     - Normalized to -25 dB FS
-
-    Duration must be between 1-30 seconds.
     """
     if not voice_mapper:
-        raise HTTPException(status_code=503, detail="VoiceMapper not initialized.")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "Service unavailable",
+                "message": "VoiceMapper not initialized."
+            }
+        )
 
     try:
-        # Process the voice file
-        processed_name, output_path = process_voice_file(voice_file)
+        # Sanitize voice name
+        voice_name = re.sub(r'[^a-zA-Z0-9_-]', '_', voice_name)
+        if not voice_name:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Invalid voice name",
+                    "message": "Voice name cannot be empty"
+                }
+            )
 
-        # Use custom name if provided
-        if voice_name:
-            # Sanitize custom name
-            voice_name = re.sub(r'[^a-zA-Z0-9_-]', '_', voice_name)
-            if voice_name and voice_name != processed_name:
-                # Check if new name already exists
-                new_output_path = os.path.join("voices", f"{voice_name}.wav")
-                if os.path.exists(new_output_path):
-                    # Clean up the file we just created
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"Voice name '{voice_name}' already exists."
-                    )
-                # Rename the file
-                try:
-                    os.rename(output_path, new_output_path)
-                    processed_name = voice_name
-                    output_path = new_output_path
-                except OSError as e:
-                    # If rename fails, clean up
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"Failed to rename voice file: {str(e)}"
-                    )
+        # Process the voice file(s)
+        processed_name, output_path = process_multiple_voice_files(voice_file, voice_name)
 
         # Reload voice mapper to include new voice
         voice_mapper.reload()
 
         return JSONResponse(
-            status_code=201,
+            status_code=200,
             content={
-                "message": "Voice uploaded successfully",
                 "voice_name": processed_name,
+                "message": "Voice uploaded successfully",
                 "file_path": output_path
             }
         )
@@ -771,7 +983,13 @@ async def upload_voice(
         raise
     except Exception as e:
         logger.error(f"Error uploading voice: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Failed to upload voice: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Internal server error",
+                "message": "An error occurred while processing the voice file"
+            }
+        )
 
 @app.delete("/voices/{voice_name}")
 async def delete_voice(voice_name: str):
