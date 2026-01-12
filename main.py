@@ -261,16 +261,21 @@ def parse_txt_script(txt_content: str) -> Tuple[List[str], List[str]]:
 
 # --- Model Management Functions ---
 
-def load_model(model_name: str = None):
+def load_model(model_name: str = None, _lock_acquired: bool = False):
     """
     Load the VibeVoice model and processor.
 
     Args:
         model_name: Model to load ("1.5b" or "7b"). Uses selected_model if None.
+        _lock_acquired: Internal flag to indicate if lock is already held (prevents deadlock)
     """
     global model, processor, voice_mapper, selected_model, last_used
 
-    with model_lock:
+    # Only acquire lock if not already held (to prevent deadlock)
+    if not _lock_acquired:
+        model_lock.acquire()
+
+    try:
         if model is not None:
             print("Model already loaded, skipping reload.", flush=True)
             logger.info("Model already loaded, skipping reload.")
@@ -318,6 +323,10 @@ def load_model(model_name: str = None):
         last_used = time.time()
         print(f"{model_to_load.upper()} model loaded successfully and ready for inference.", flush=True)
         logger.info(f"{model_to_load.upper()} model loaded successfully and ready for inference.")
+    finally:
+        # Only release lock if we acquired it
+        if not _lock_acquired:
+            model_lock.release()
 
 
 def ensure_model_loaded():
@@ -327,7 +336,8 @@ def ensure_model_loaded():
     with model_lock:
         if model is None:
             try:
-                load_model()
+                # Pass _lock_acquired=True since we already hold the lock
+                load_model(_lock_acquired=True)
             except Exception as e:
                 print(f"Failed to load model: {e}", flush=True)
                 logger.error(f"Failed to load model: {e}", exc_info=True)
