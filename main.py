@@ -272,11 +272,13 @@ def load_model(model_name: str = None):
 
     with model_lock:
         if model is not None:
+            print("Model already loaded, skipping reload.", flush=True)
             logger.info("Model already loaded, skipping reload.")
             last_used = time.time()
             return
 
         model_to_load = model_name.lower() if model_name else selected_model.lower()
+        print(f"Loading {model_to_load.upper()} model...", flush=True)
         logger.info(f"Loading {model_to_load.upper()} model...")
 
         # Select model path based on model name
@@ -286,30 +288,52 @@ def load_model(model_name: str = None):
             model_path = "microsoft/VibeVoice-1.5B"
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}, model path: {model_path}", flush=True)
         logger.info(f"Using device: {device}, model path: {model_path}")
 
         # Initialize voice mapper if not already done
         if voice_mapper is None:
+            print("Initializing voice mapper...", flush=True)
             logger.info("Initializing voice mapper...")
             voice_mapper = VoiceMapper(builtin_path="demo/voices", user_path="voices")
 
         # Load processor and model
+        print("Loading processor from Hugging Face (this may take a while if not cached)...", flush=True)
         logger.info("Loading processor...")
         processor = VibeVoiceProcessor.from_pretrained(model_path)
+        print("Processor loaded. Loading model from Hugging Face (this may take several minutes)...", flush=True)
         logger.info("Processor loaded. Loading model (this may take several minutes)...")
-        
+
         model = VibeVoiceForConditionalGenerationInference.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             device_map=device,
             attn_implementation="sdpa"
         )
+        print("Model loaded. Setting to eval mode and configuring inference steps...", flush=True)
         logger.info("Model loaded. Setting to eval mode and configuring inference steps...")
         model.eval()
         model.set_ddpm_inference_steps(num_steps=10)
 
         last_used = time.time()
+        print(f"{model_to_load.upper()} model loaded successfully and ready for inference.", flush=True)
         logger.info(f"{model_to_load.upper()} model loaded successfully and ready for inference.")
+
+
+def ensure_model_loaded():
+    """Ensure the model is loaded before use."""
+    global model, last_used
+
+    with model_lock:
+        if model is None:
+            try:
+                load_model()
+            except Exception as e:
+                print(f"Failed to load model: {e}", flush=True)
+                logger.error(f"Failed to load model: {e}", exc_info=True)
+                raise
+        else:
+            last_used = time.time()
 
 
 def unload_model():
@@ -320,9 +344,11 @@ def unload_model():
 
     with model_lock:
         if model is None:
+            print("Model already unloaded.", flush=True)
             logger.info("Model already unloaded.")
             return
 
+        print("Unloading model and clearing GPU memory...", flush=True)
         logger.info("Unloading model and clearing GPU memory...")
 
         # Move model to CPU and delete
@@ -345,22 +371,8 @@ def unload_model():
         processor = None
         last_used = 0.0
 
+        print("Model unloaded and GPU memory cleared.", flush=True)
         logger.info("Model unloaded and GPU memory cleared.")
-
-
-def ensure_model_loaded():
-    """Ensure the model is loaded before use."""
-    global model, last_used
-
-    with model_lock:
-        if model is None:
-            try:
-                load_model()
-            except Exception as e:
-                logger.error(f"Failed to load model: {e}", exc_info=True)
-                raise
-        else:
-            last_used = time.time()
 
 
 def unload_monitor():
@@ -369,6 +381,7 @@ def unload_monitor():
     """
     global monitor_running, last_used, unload_timeout
 
+    print(f"Model auto-unload monitor started (timeout: {unload_timeout}s)", flush=True)
     logger.info(f"Model auto-unload monitor started (timeout: {unload_timeout}s)")
 
     while monitor_running:
@@ -378,6 +391,7 @@ def unload_monitor():
             if model is not None and last_used > 0:
                 time_since_last_use = time.time() - last_used
                 if time_since_last_use >= unload_timeout:
+                    print(f"Model inactive for {time_since_last_use:.1f}s, auto-unloading...", flush=True)
                     logger.info(f"Model inactive for {time_since_last_use:.1f}s, auto-unloading...")
                     unload_model()
 
@@ -388,31 +402,42 @@ def generation_worker():
     """
     A dedicated worker thread that continuously processes tasks from the queue.
     """
+    print("Generation worker started.", flush=True)
     logger.info("Generation worker started.")
     while True:
+        print("Worker waiting for task from queue...", flush=True)
         task_id, script_content, speaker_names, cfg_scale = task_queue.get()
         if task_id is None: # A way to stop the worker thread if needed.
             break
 
         try:
+            print(f"Worker picked up task {task_id}.", flush=True)
             logger.info(f"Worker picked up task {task_id}.")
             start_time = time.time()
 
-            # Check if model needs to be loaded and update status
+            # Check if model needs to be loaded
             needs_loading = False
             with model_lock:
                 if model is None:
                     needs_loading = True
-            
+
+            # Always update status when worker picks up task
             if needs_loading:
+                print(f"Model not loaded, loading now for task {task_id}...", flush=True)
                 logger.info(f"Model not loaded, loading now for task {task_id}...")
                 tasks[task_id]["status"] = "loading_model"
-            
+            else:
+                # Model is already loaded, set status to running immediately
+                tasks[task_id]["status"] = "running"
+
             # Ensure model is loaded before processing (this may take several minutes)
+            print("Calling ensure_model_loaded()...", flush=True)
             ensure_model_loaded()
-            
-            # Update status to running after model is loaded
+            print("ensure_model_loaded() completed.", flush=True)
+
+            # Update status to running after model is loaded (if it was loading)
             if needs_loading:
+                print(f"Model loaded successfully, starting generation for task {task_id}...", flush=True)
                 logger.info(f"Model loaded successfully, starting generation for task {task_id}...")
                 tasks[task_id]["status"] = "running"
 
@@ -471,42 +496,30 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 async def startup_event():
     global model, processor, voice_mapper, selected_model, unload_monitor_thread, monitor_running
 
+    print(f"Application startup: initializing {selected_model.upper()} model configuration...", flush=True)
     logger.info(f"Application startup: initializing {selected_model.upper()} model configuration...")
 
     # Initialize voice mapper (doesn't require model)
     if voice_mapper is None:
+        print("Initializing voice mapper...", flush=True)
         voice_mapper = VoiceMapper(builtin_path="demo/voices", user_path="voices")
 
     # Model will be loaded on first use (lazy loading)
     # This allows the API to start quickly and load model only when needed
 
     # Start the background worker thread
+    print("Starting generation worker thread...", flush=True)
     worker_thread = threading.Thread(target=generation_worker, daemon=True)
     worker_thread.start()
+    print("Generation worker thread started.", flush=True)
 
     # Start the auto-unload monitor thread
     monitor_running = True
     unload_monitor_thread = threading.Thread(target=unload_monitor, daemon=True)
     unload_monitor_thread.start()
 
+    print(f"Application started. Model will be loaded on first request (auto-unload timeout: {unload_timeout}s).", flush=True)
     logger.info(f"Application started. Model will be loaded on first request (auto-unload timeout: {unload_timeout}s).")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on application shutdown."""
-    global monitor_running, model
-
-    logger.info("Application shutting down...")
-
-    # Stop the monitor thread
-    monitor_running = False
-
-    # Unload model if loaded
-    if model is not None:
-        unload_model()
-
-    logger.info("Shutdown complete.")
 
 # --- Pydantic Models for API I/O ---
 
@@ -749,16 +762,9 @@ if __name__ == "__main__":
         default=8000,
         help="Port to bind to (default: 8000)"
     )
-    parser.add_argument(
-        "--unload-timeout",
-        type=float,
-        default=10.0,
-        help="Seconds of inactivity before auto-unloading model (default: 10.0, set to 0 to disable)"
-    )
 
     args = parser.parse_args()
     selected_model = args.model.lower()
-    unload_timeout = args.unload_timeout
 
     # Ensure voices directory exists
     os.makedirs("voices", exist_ok=True)
